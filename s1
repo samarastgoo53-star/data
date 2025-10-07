@@ -1,0 +1,212 @@
+# supermarket_system.py
+"""
+FULL SUPERMARKET SYSTEM (WEB + DATABASE + CLI)
+-----------------------------------------------
+- Uses Flask + SQLite + SQLAlchemy + Tabulate
+- CLI for adding/listing/sales/report
+- Web page for viewing inventory
+
+Run CLI:  python supermarket_system.py
+Run Web:  python supermarket_system.py web
+""
+
+from flask import Flask, render_template_string, request, jsonify
+from flask_sqlalchemy import SQLAlchemy
+from tabulate import tabulate
+import sys
+import os
+
+# ---------------------- Flask + Database Setup ----------------------
+BASE_DIR = os.path.abspath(os.path.dirname(__file__))
+DB_PATH = os.path.join(BASE_DIR, "supermarket.db")
+
+app = Flask(__name__)
+app.config["SQLALCHEMY_DATABASE_URI"] = f"sqlite:///{DB_PATH}"
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+
+db = SQLAlchemy(app)
+
+# ---------------------- Models ----------------------
+class Product(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    sku = db.Column(db.String(64), unique=True, nullable=False)
+    name = db.Column(db.String(200), nullable=False)
+    price = db.Column(db.Float, nullable=False)
+    stock = db.Column(db.Integer, nullable=False, default=0)
+
+class Sale(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    product_id = db.Column(db.Integer, db.ForeignKey("product.id"), nullable=False)
+    quantity = db.Column(db.Integer, nullable=False)
+    total = db.Column(db.Float, nullable=False)
+    date = db.Column(db.DateTime, server_default=db.func.now())
+
+# ---------------------- Initialize DB ----------------------
+def init_db():
+    with app.app_context():
+        db.create_all()
+        if Product.query.count() == 0:
+            demo = [
+                Product(sku="APL001", name="Apple (1kg)", price=3.50, stock=50),
+                Product(sku="BNN001", name="Banana (1 bunch)", price=1.20, stock=80),
+                Product(sku="MLK001", name="Milk (1L)", price=1.50, stock=30),
+            ]
+            db.session.bulk_save_objects(demo)
+            db.session.commit()
+            print("✅ Database initialized with sample data.")
+        else:
+            print("✅ Database ready.")
+
+# ---------------------- CLI Functions ----------------------
+def list_products():
+    with app.app_context():
+        products = Product.query.all()
+        if not products:
+            print("No products found.")
+            return
+        data = [[p.id, p.sku, p.name, p.price, p.stock] for p in products]
+        print(tabulate(data, headers=["ID", "SKU", "Name", "Price", "Stock"], tablefmt="grid"))
+
+def add_product():
+    with app.app_context():
+        sku = input("SKU: ")
+        name = input("Product name: ")
+        price = float(input("Price: "))
+        stock = int(input("Stock: "))
+        p = Product(sku=sku, name=name, price=price, stock=stock)
+        db.session.add(p)
+        db.session.commit()
+        print(f"✅ Added {name}.")
+
+def record_sale():
+    with app.app_context():
+        pid = int(input("Product ID: "))
+        qty = int(input("Quantity: "))
+        product = Product.query.get(pid)
+        if not product:
+            print("❌ Product not found.")
+            return
+        if product.stock < qty:
+            print("⚠️ Not enough stock!")
+            return
+        total = product.price * qty
+        sale = Sale(product_id=pid, quantity=qty, total=total)
+        product.stock -= qty
+        db.session.add(sale)
+        db.session.commit()
+        print(f"💰 Sold {qty} x {product.name} = ${total:.2f}")
+
+def sales_report():
+    with app.app_context():
+        sales = (
+            db.session.query(Product.name, db.func.sum(Sale.quantity), db.func.sum(Sale.total))
+            .join(Sale, Sale.product_id == Product.id)
+            .group_by(Product.name)
+            .all()
+        )
+        if not sales:
+            print("No sales yet.")
+            return
+        data = [[s[0], s[1], round(s[2], 2)] for s in sales]
+        print(tabulate(data, headers=["Product", "Total Qty", "Total Revenue"], tablefmt="grid"))
+
+# ---------------------- Flask Web Routes ----------------------
+TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Supermarket Inventory</title>
+  <style>
+    body {font-family: Arial; margin: 40px; background: #f4f4f4;}
+    table {border-collapse: collapse; width: 80%; background: white;}
+    th, td {padding: 10px; border: 1px solid #ccc; text-align: center;}
+    th {background: #eee;}
+  </style>
+</head>
+<body>
+  <h1>🛒 Supermarket Inventory</h1>
+  <table>
+    <thead><tr><th>ID</th><th>SKU</th><th>Name</th><th>Price</th><th>Stock</th></tr></thead>
+    <tbody>
+      {% for p in products %}
+      <tr>
+        <td>{{ p.id }}</td>
+        <td>{{ p.sku }}</td>
+        <td>{{ p.name }}</td>
+        <td>${{ "%.2f"|format(p.price) }}</td>
+        <td>{{ p.stock }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <p><em>Use POST /checkout with JSON body to simulate checkout.</em></p>
+</body>
+</html>
+"""
+
+@app.route("/")
+def index():
+    products = Product.query.all()
+    return render_template_string(TEMPLATE, products=products)
+
+@app.route("/checkout", methods=["POST"])
+def checkout():
+    items = request.get_json()
+    if not items or not isinstance(items, list):
+        return jsonify({"error": "Invalid JSON"}), 400
+    total = 0
+    for item in items:
+        p = Product.query.get(item["product_id"])
+        qty = int(item["qty"])
+        if not p or p.stock < qty:
+            return jsonify({"error": f"Not enough stock for {p.name}"}), 400
+        line_total = p.price * qty
+        total += line_total
+        sale = Sale(product_id=p.id, quantity=qty, total=line_total)
+        p.stock -= qty
+        db.session.add(sale)
+    db.session.commit()
+    return jsonify({"message": "Sale complete!", "total": round(total, 2)})
+
+# ---------------------- Main Menu ----------------------
+def main_menu():
+    while True:
+        print("""
+==== SUPERMARKET SYSTEM ====
+1. Initialize Database
+2. List Products
+3. Add Product
+4. Record Sale
+5. Sales Report
+6. Run Web Server
+7. Exit
+""")
+        choice = input("Enter choice: ")
+        if choice == "1":
+            init_db()
+        elif choice == "2":
+            list_products()
+        elif choice == "3":
+            add_product()
+        elif choice == "4":
+            record_sale()
+        elif choice == "5":
+            sales_report()
+        elif choice == "6":
+            print("🚀 Starting web server at http://127.0.0.1:5000")
+            app.run(debug=True)
+        elif choice == "7":
+            print("👋 Goodbye!")
+            break
+        else:
+            print("Invalid choice.")
+
+# ---------------------- Entry Point ----------------------
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "web":
+        init_db()
+        print("🌐 Web mode: http://127.0.0.1:5000")
+        app.run(debug=True)
+    else:
+        init_db()
+        main_menu()
